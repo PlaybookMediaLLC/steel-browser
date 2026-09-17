@@ -39,10 +39,11 @@ import {
 import { filterHeaders, getChromeExecutablePath, installMouseHelper } from "../../utils/browser.js";
 import {
   deepMerge,
-  extractStorageForPage,
+  extractStorageForPageWithTimeout,
   getProfilePath,
   groupSessionStorageByOrigin,
   handleFrameNavigated,
+  safePageUrl,
 } from "../../utils/context.js";
 import { getExtensionPaths } from "../../utils/extensions.js";
 import { RetryManager, RetryOptions } from "../../utils/retry.js";
@@ -99,6 +100,7 @@ export class CDPService extends EventEmitter {
   private defaultTimezone: string;
   private pluginManager: PluginManager;
   private trackedOrigins: Set<string> = new Set<string>();
+  private crashedPages: WeakSet<Page> = new WeakSet<Page>();
   private chromeSessionService: ChromeContextService;
   private retryManager: RetryManager;
   private targetInstrumentationManager: TargetInstrumentationManager;
@@ -346,6 +348,13 @@ export class CDPService extends EventEmitter {
         return;
       }
 
+      // Puppeteer emits "error" when the renderer for this page crashes. The browser
+      // process survives, so CDP calls against the page hang instead of rejecting.
+      page.on("error", (err) => {
+        this.crashedPages.add(page);
+        this.logger.error({ err, url: safePageUrl(page) }, "[CDPService] Page renderer crashed");
+      });
+
       try {
         try {
           const url = page.url();
@@ -496,6 +505,7 @@ export class CDPService extends EventEmitter {
   public async shutdown(reason: ShutdownReason): Promise<void> {
     this.shuttingDown = true;
     this.logger.info(`[CDPService] Shutting down and cleaning up resources (reason: ${reason})`);
+    this.chromeSessionService.invalidate();
 
     try {
       if (this.browserInstance) {
@@ -1292,8 +1302,13 @@ export class CDPService extends EventEmitter {
     try {
       const pages = await this.browserInstance.pages();
 
+      let crashedCount = 0;
       const validPages = pages.filter((page) => {
         try {
+          if (this.crashedPages.has(page)) {
+            crashedCount++;
+            return false;
+          }
           const url = page.url();
           return url && url.startsWith("http");
         } catch (e) {
@@ -1302,11 +1317,12 @@ export class CDPService extends EventEmitter {
       });
 
       this.logger.info(
-        `[CDPService] Processing ${validPages.length} valid pages out of ${pages.length} total for storage extraction`,
+        `[CDPService] Processing ${validPages.length} valid pages out of ${pages.length} total for storage extraction` +
+          (crashedCount > 0 ? ` (skipped ${crashedCount} crashed)` : ""),
       );
 
       const results = await Promise.all(
-        validPages.map((page) => extractStorageForPage(page, this.logger)),
+        validPages.map((page) => extractStorageForPageWithTimeout(page, this.logger)),
       );
 
       // Merge all results
