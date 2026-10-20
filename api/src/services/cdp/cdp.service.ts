@@ -180,6 +180,8 @@ export class CDPService extends EventEmitter {
     this.targetInstrumentationManager = new TargetInstrumentationManager(
       this.instrumentationLogger,
       this.logger,
+      undefined,
+      this.pluginManager.onTargetSession.bind(this.pluginManager),
     );
     this.instrumentationLogger?.on?.(EmitEvent.Log, (event, context) => {
       this.emit(EmitEvent.Log, event);
@@ -443,7 +445,7 @@ export class CDPService extends EventEmitter {
     const blockedHosts = isOptimizeObject ? optimize.blockHosts : undefined;
 
     if (parsed && this.launchConfig?.blockAds && isAdRequest(parsed)) {
-      this.logger.info(`[CDPService] Blocked request to ad related resource: ${url}`);
+      this.logger.debug(`[CDPService] Blocked request to ad related resource: ${url}`);
       await request.abort();
       return;
     }
@@ -452,7 +454,7 @@ export class CDPService extends EventEmitter {
       (parsed && isHostBlocked(parsed, blockedHosts)) ||
       isUrlMatchingPatterns(url, this.compiledUrlPatterns)
     ) {
-      this.logger.info(`[CDPService] Blocked request to blocked host or pattern: ${url}`);
+      this.logger.debug(`[CDPService] Blocked request to blocked host or pattern: ${url}`);
       await request.abort();
       return;
     }
@@ -469,7 +471,7 @@ export class CDPService extends EventEmitter {
         (blockMedia && (resourceType === "media" || isHeavyMediaRequest(parsed))) ||
         (blockStylesheets && resourceType === "stylesheet")
       ) {
-        this.logger.info(
+        this.logger.debug(
           `[CDPService] Blocked ${resourceType} resource due to optimizeBandwidth (${
             blockImages ? "blockImages" : ""
           }${blockMedia ? "blockMedia" : ""}${blockStylesheets ? "blockStylesheets" : ""}): ${url}`,
@@ -612,6 +614,7 @@ export class CDPService extends EventEmitter {
             "[CDPService] Reusing existing browser instance with default configuration.",
           );
           this.launchConfig = config || this.defaultLaunchConfig;
+          this.currentSessionConfig = this.launchConfig;
 
           const reuseOptimize = this.launchConfig.optimizeBandwidth;
           const reusePatterns =
@@ -1362,7 +1365,9 @@ export class CDPService extends EventEmitter {
 
   @traceable
   public async startNewSession(sessionConfig: BrowserLauncherOptions): Promise<Browser> {
-    this.currentSessionConfig = sessionConfig;
+    // Keep shutdown hooks bound to the outgoing browser. launchInternal assigns
+    // the incoming config only after teardown (or when reusing the browser), so
+    // incoming metadata cannot affect cleanup of the previous browser instance.
     this.trackedOrigins.clear(); // Clear tracked origins when starting a new session
 
     // Recreate target instrumentation manager with session-specific options
@@ -1373,6 +1378,7 @@ export class CDPService extends EventEmitter {
         dangerouslyLogRequestDetails: sessionConfig.dangerouslyLogRequestDetails,
         captureWorkerNetwork: sessionConfig.captureWorkerNetwork,
       },
+      this.pluginManager.onTargetSession.bind(this.pluginManager),
     );
 
     // Notify plugins that a session is starting, before any launch/reuse work begins.
@@ -1412,6 +1418,8 @@ export class CDPService extends EventEmitter {
       this.targetInstrumentationManager = new TargetInstrumentationManager(
         this.instrumentationLogger,
         this.logger,
+        undefined,
+        this.pluginManager.onTargetSession.bind(this.pluginManager),
       );
     } finally {
       await this.pluginManager.onAfterSessionEnd(sessionConfig);
@@ -1509,14 +1517,15 @@ export class CDPService extends EventEmitter {
         await session.send("Emulation.setUserAgentOverride", {
           userAgent: userAgent,
           acceptLanguage: headers["accept-language"],
-          platform: fingerprint.navigator.platform || "Linux x86_64",
+          platform: userAgentMetadata.platform || fingerprint.navigator.platform || "Linux x86_64",
           userAgentMetadata: {
             brands:
               userAgentMetadata.brands as unknown as Protocol.Emulation.UserAgentMetadata["brands"],
             fullVersionList:
               userAgentMetadata.fullVersionList as unknown as Protocol.Emulation.UserAgentMetadata["fullVersionList"],
             fullVersion: userAgentMetadata.uaFullVersion,
-            platform: fingerprint.navigator.platform || "Linux x86_64",
+            platform:
+              userAgentMetadata.platform || fingerprint.navigator.platform || "Linux x86_64",
             platformVersion: userAgentMetadata.platformVersion || "",
             architecture: userAgentMetadata.architecture || "x86",
             model: userAgentMetadata.model || "",
@@ -1580,7 +1589,6 @@ export class CDPService extends EventEmitter {
         screenHeight: screen.height,
         width: screen.width,
         height: screen.height,
-        viewport: { width: screen.availWidth, height: screen.availHeight, scale: 1, x: 0, y: 0 },
         mobile: /phone|android|mobile/i.test(userAgent),
         screenOrientation:
           screen.height > screen.width
@@ -1588,6 +1596,16 @@ export class CDPService extends EventEmitter {
             : { angle: 90, type: "landscapePrimary" },
         deviceScaleFactor: screen.devicePixelRatio,
       });
+
+      if (/phone|android|mobile/i.test(userAgent)) {
+        const maxTouchPoints =
+          (this.fingerprintData?.fingerprint.navigator as { maxTouchPoints?: number })
+            .maxTouchPoints ?? 1;
+        await session.send("Emulation.setTouchEmulationEnabled", {
+          enabled: true,
+          maxTouchPoints,
+        });
+      }
     } finally {
       await session.detach().catch(() => {});
     }
