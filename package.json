@@ -25,7 +25,7 @@
     "typescript": "^5.7.3"
   },
   "engines": {
-    "node": ">=22"
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
   },
   "dependencies": {
     "@types/lodash-es": "^4.17.12",

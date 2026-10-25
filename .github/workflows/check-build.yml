@@ -3,6 +3,7 @@ name: Check Docker Build
 on:
   pull_request:
     branches:
+      - develop
       - main
 
 jobs:
@@ -27,3 +28,18 @@ jobs:
       - name: Build the latest Steel Browser UI image
         run: |
           docker build -t steel-browser-ui -f ./ui/Dockerfile .
+
+  ci-validation:
+    name: CI validation
+    if: always()
+    needs: [check-docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every validation job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          test -n "$RESULTS"
+          for result in $RESULTS; do
+            test "$result" = success || exit 1
+          done
