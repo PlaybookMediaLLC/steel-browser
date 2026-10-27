@@ -25,3 +25,6 @@ out
 dist
 .aider*
 extensions/*
+
+# code-review-graph database (built per session)
+.code-review-graph/
